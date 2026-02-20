@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
@@ -13,8 +14,10 @@ load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 RPC_URL = "https://bsc-dataseed.binance.org/"
-# The Smart Contract Address
-CONTRACT_ADDRESS = "0x424621D3Efa7bB7214D11f95B6Aa04D9CE6AEBeF" 
+
+# Contract addresses by agent type (type is set per chat via access code A-XXX / B-XXX)
+CONTRACT_ECHO = "0xC0AD345393752506Eb63A627a124646645f8267f"
+CONTRACT_TRADER = "0x424621D3Efa7bB7214D11f95B6Aa04D9CE6AEBeF" 
 
 # Setup Logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -45,7 +48,20 @@ CONTRACT_ABI = [{
     "type": "function"
 }]
 
-contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=CONTRACT_ABI)
+def _contract(agent_type: str):
+    """Contract instance for the given agent type (A = Echo, B = Trader)."""
+    addr = CONTRACT_ECHO if agent_type == "A" else CONTRACT_TRADER
+    return w3.eth.contract(address=Web3.to_checksum_address(addr), abi=CONTRACT_ABI)
+
+# Known token symbols -> BSC address (for type B)
+TOKENS_JSON_PATH = os.path.join(os.path.dirname(__file__), "tokens.json")
+TOKEN_SYMBOLS: Dict[str, str] = {}
+if os.path.isfile(TOKENS_JSON_PATH):
+    try:
+        with open(TOKENS_JSON_PATH, "r") as f:
+            TOKEN_SYMBOLS = json.load(f)
+    except Exception as e:
+        logger.warning(f"Could not load tokens.json: {e}")
 
 # --- SESSION STORAGE ---
 # Format: { user_id: { "type": "A"|"B", "tokenId": int, "data": { "action": str, "token": str, "amount": str } } }
@@ -53,25 +69,69 @@ sessions: Dict[int, Any] = {}
 
 # --- HELPER FUNCTIONS ---
 
-def extract_intent(text: str) -> Optional[str]:
-    """
-    Determines if the user wants to BUY, SELL, or CHECK BALANCE based on keywords.
-    """
-    text_lower = text.lower()
-    
-    # Keywords for BUY
-    if any(word in text_lower for word in ["buy", "swap", "purchase", "ape", "long"]):
-        return "buy_token"
-    
-    # Keywords for SELL
-    if any(word in text_lower for word in ["sell", "dump", "exit", "short"]):
-        return "sell_token"
-    
-    # Keywords for CHECK BALANCE
-    if any(word in text_lower for word in ["balance", "check balance", "check", "what is the balance", "show balance"]):
-        return "check_balance"
-        
+def resolve_token(token: str) -> Optional[str]:
+    """Resolve token to BSC address: if already 0x... return it, else look up symbol in tokens.json."""
+    if not token or not token.strip():
+        return None
+    token = token.strip()
+    if re.match(r"^0x[a-fA-F0-9]{40}$", token):
+        return w3.to_checksum_address(token)
+    sym = token.upper()
+    if sym in TOKEN_SYMBOLS:
+        return w3.to_checksum_address(TOKEN_SYMBOLS[sym])
     return None
+
+def claude_get_intent(user_message: str, agent_type: str) -> Dict[str, Any]:
+    """
+    Uses Claude to understand user intent. agent_type is "A" or "B" (passed so Claude knows allowed actions).
+    Returns either {"understood": True, "action": str, "token": str, "amount": str|None} or {"understood": False, "message": str}.
+    """
+    api_key = os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        return {"understood": False, "message": "Bot is not configured with an API key for understanding messages."}
+
+    allowed = (
+        "Only allowed action: echo_message (write the user's message on-chain)."
+        if agent_type == "A"
+        else "Allowed actions: buy_token, sell_token, check_balance. For buy_token/sell_token you need a token (BSC address 0x... or symbol like CAKE, BNB) and an amount in BNB. For check_balance only the token."
+    )
+    system = (
+        f"You are a blockchain bot. Agent type is {agent_type}. {allowed}\n"
+        "Understand the user in ANY language (French, English, slang, etc.): e.g. 'achete 0.001 bnb de cake' = buy 0.001 BNB of CAKE.\n"
+        "Token: accept symbol (CAKE, cake, BNB...) or full address 0x.... If the user only gives a name/symbol you don't recognize as a standard token, set understood: false and ask for the token address (0x...) in the same language as the user.\n"
+        "Reply ONLY with a single JSON object, no markdown or extra text. "
+        "If you understand: {\"understood\": true, \"action\": \"buy_token\"|\"sell_token\"|\"check_balance\", \"token\": \"...\", \"amount\": \"...\" (only for buy/sell)}\n"
+        "If not: {\"understood\": false, \"message\": \"Short reply in the user's language (e.g. ask for token address or rephrase).\"}"
+    )
+    try:
+        client = __import__("anthropic").Anthropic(api_key=api_key)
+        model = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5")
+        resp = client.messages.create(
+            model=model,
+            max_tokens=512,
+            system=system,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        text = resp.content[0].text if resp.content else ""
+        # Strip markdown code blocks if present
+        if "```" in text:
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        data = json.loads(text.strip())
+        if data.get("understood"):
+            return {
+                "understood": True,
+                "action": (data.get("action") or "").strip(),
+                "token": (data.get("token") or "").strip() or None,
+                "amount": (data.get("amount") or "").strip() or None,
+            }
+        return {"understood": False, "message": (data.get("message") or "I didn't understand. Please try again.")}
+    except json.JSONDecodeError as e:
+        logger.warning(f"Claude returned non-JSON: {e}")
+        return {"understood": False, "message": "I didn't understand that. Try: \"Buy 0.001 BNB of CAKE\" or \"Check balance of 0x...\"."}
+    except Exception as e:
+        logger.exception(f"Claude API error: {e}")
+        return {"understood": False, "message": "Something went wrong. Please try again later."}
 
 def extract_address(text: str) -> Optional[str]:
     """
@@ -107,10 +167,10 @@ def extract_amount(text: str, token_id: int) -> Optional[str]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome!\n\n"
-        "Please authenticate using your access code format:\n"
-        "👉 **A-XXX** (for Echo Agent)\n"
-        "👉 **B-XXX** (for Trader Agent)\n\n"
-        "Example: `B-123`"
+        "Send your access code:\n"
+        "👉 **A-XXX** — Echo (write messages on-chain)\n"
+        "👉 **B-XXX** — Trader (buy, sell, check balance)\n\n"
+        "Example: `A-1` or `B-123`"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,23 +179,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 1. AUTHENTICATION (If user is not logged in)
     if user_id not in sessions:
-        # Regex to match A-123 or B-456
         match = re.match(r"^([AB])-(\d+)$", text.upper())
         if match:
-            agent_type, token_id = match.groups()
+            code_type, token_id = match.groups()
             sessions[user_id] = {
-                "type": agent_type, 
-                "tokenId": int(token_id), 
-                "data": {"action": None, "token": None, "amount": None}
+                "type": code_type,
+                "tokenId": int(token_id),
+                "data": {"action": None, "token": None, "amount": None},
             }
-            
-            role_name = "Echo" if agent_type == "A" else "Trader"
+            role_name = "Echo" if code_type == "A" else "Trader"
             await update.message.reply_text(
                 f"✅ Authenticated as **{role_name}** (ID: {token_id}).\n"
-                f"{'Send any text to echo.' if agent_type == 'A' else 'Tell me what to buy, sell, or check balance.'}"
+                f"{'Send any text to write on-chain.' if code_type == 'A' else 'Tell me what to buy, sell, or check balance (e.g. "Buy 0.001 BNB of CAKE").'}"
             )
         else:
-            await update.message.reply_text("❌ Invalid format. Please send a code like `A-1` or `B-10`.")
+            await update.message.reply_text("❌ Invalid format. Send a code like `A-1` or `B-123`.")
         return
 
     # Load session
@@ -149,149 +207,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             # Type A payload is just dummy bytes or string encoding
             payload = text.encode('utf-8') 
-            tx_hash = send_transaction(session["tokenId"], text, payload)
+            tx_hash = send_transaction(session["tokenId"], text, payload, session["type"])
             await update.message.reply_text(f"✅ Message sent!\nHash: {tx_hash}")
         except Exception as e:
             await update.message.reply_text(f"❌ Error: {str(e)}")
         return
 
     # ---------------------------------------------------------
-    # AGENT TYPE B: TRADER (The Logic You Requested)
+    # AGENT TYPE B: TRADER (Claude parses intent, then we execute)
     # ---------------------------------------------------------
     elif session["type"] == "B":
-        data = session["data"]
-        
-        # --- STEP 1: UNDERSTAND INTENT (BUY/SELL/CHECK_BALANCE) ---
-        # If we don't know the action yet, try to find it
-        if not data["action"]:
-            intent = extract_intent(text)
-            if intent:
-                data["action"] = intent
-            # If still no action and previous data is empty, we must ask
-            elif not data["token"] and not data["amount"]:
-                await update.message.reply_text("🤖 Do you want to **Buy**, **Sell**, or **Check Balance**?")
-                return
+        intent = claude_get_intent(text, "B")
+        if not intent.get("understood"):
+            await update.message.reply_text(intent.get("message", "I didn't understand. Please try again."))
+            return
 
-        # --- STEP 2: EXTRACT PARAMETERS (Token & Amount) ---
-        # Try to extract address if missing
-        if not data["token"]:
-            address = extract_address(text)
-            if address:
-                data["token"] = address
+        action = (intent.get("action") or "").strip().lower()
+        token_raw = intent.get("token")
+        amount_raw = intent.get("amount")
 
-        # Try to extract amount if missing (only for buy/sell, not for check_balance)
-        if data["action"] != "check_balance" and not data["amount"]:
-            amount = extract_amount(text, session["tokenId"])
-            if amount:
-                data["amount"] = amount
+        if action not in ("buy_token", "sell_token", "check_balance"):
+            await update.message.reply_text("I can only help with: buy, sell, or check balance. Please rephrase.")
+            return
 
-        # --- STEP 3: CHECK FOR MISSING INFO ---
-        missing_fields = []
-        if not data["action"]: 
-            missing_fields.append("Action (Buy/Sell/Check Balance)")
-        
-        if not data["token"]: 
-            missing_fields.append("Token Address (0x...)")
-        
-        # Amount is only required for buy/sell, not for check_balance
-        if data["action"] in ["buy_token", "sell_token"] and not data["amount"]:
-            missing_fields.append("Amount (in BNB)")
-
-        # If anything is missing, ask the user specifically for it
-        if missing_fields:
-            current_status = (
-                f"📝 **Current Status:**\n"
-                f"• Action: {data['action'] or '❓'}\n"
-                f"• Token: {data['token'] or '❓'}\n"
-            )
-            if data["action"] in ["buy_token", "sell_token"]:
-                current_status += f"• Amount: {data['amount'] or '❓'}\n"
-            current_status += "\n"
-            
+        token_address = resolve_token(token_raw) if token_raw else None
+        if not token_address:
             await update.message.reply_text(
-                f"{current_status}"
-                f"❌ I am missing: **{', '.join(missing_fields)}**.\n"
-                f"Please provide the missing information."
+                f"I couldn't find a valid token from « {token_raw or '?'} ». Use an address (0x...) or a symbol like CAKE, BNB."
             )
             return
 
-        # --- STEP 4: EXECUTE ACTION ---
-        # Prepare message based on action type
-        if data["action"] == "check_balance":
-            await update.message.reply_text(
-                f"✅ **Checking balance...**\n"
-                f"🪙 Token: {data['token']}\n\n"
-                f"⏳ Querying contract..."
-            )
+        if action in ("buy_token", "sell_token"):
+            if not amount_raw:
+                await update.message.reply_text("Please specify an amount in BNB (e.g. 0.001).")
+                return
+            try:
+                amount_val = float(amount_raw.replace(",", "."))
+            except ValueError:
+                await update.message.reply_text("Invalid amount. Use a number for BNB (e.g. 0.001).")
+                return
+            if amount_val <= 0:
+                await update.message.reply_text("Amount must be greater than 0.")
+                return
+            data_amount = str(amount_val)
+        else:
+            data_amount = None
+
+        # --- EXECUTE ---
+        if action == "check_balance":
+            await update.message.reply_text(f"✅ Checking balance for token {token_address[:10]}...\n⏳ Querying contract...")
         else:
             await update.message.reply_text(
-                f"✅ **Ready to execute!**\n"
-                f"🚀 {data['action'].upper().replace('_', ' ')}\n"
-                f"🪙 Token: {data['token']}\n"
-                f"💰 Amount: {data['amount']} BNB\n\n"
-                f"⏳ Encoding payload and sending transaction..."
+                f"✅ **{action.replace('_', ' ').title()}**\n"
+                f"🪙 Token: {token_address[:10]}...\n"
+                f"💰 Amount: {data_amount} BNB\n\n⏳ Sending transaction..."
             )
 
         try:
-            # 1. Format the data for the Smart Contract
-            token_address = w3.to_checksum_address(data["token"])
-            
-            # 2. Calculate Payload based on action type
-            if data["action"] == "check_balance":
-                # For check_balance, payload is just the token address
-                # Solidity: abi.encode(address)
-                payload = abi_encode(
-                    ['address'],  # Types
-                    [token_address]  # Values
-                )
-            else:
-                # For buy_token and sell_token, payload includes amount and slippage
-                # Solidity: abi.encode(token_address, amountBNB, slippageBps)
-                amount_wei = w3.to_wei(float(data["amount"]), 'ether')
-                slippage_bps = 0  # Default slippage (0%)
-                payload = abi_encode(
-                    ['address', 'uint256', 'uint256'],  # Types
-                    [token_address, amount_wei, slippage_bps]  # Values
-                )
-
-            # 3. Call the Smart Contract function
-            # function handleAction(uint256 tokenId, string action, bytes payload)
-            if data["action"] == "check_balance":
-                # For check_balance, we use call() to get the result without sending a transaction
-                bnb_balance, token_balance = call_check_balance(session["tokenId"], payload)
-                
-                # Format balances for display
-                bnb_balance_ether = w3.from_wei(bnb_balance, 'ether')
+            if action == "check_balance":
+                payload = abi_encode(["address"], [token_address])
+                bnb_balance, token_balance = call_check_balance(session["tokenId"], payload, session["type"])
+                bnb_balance_ether = w3.from_wei(bnb_balance, "ether")
                 token_balance_formatted = format_token_balance(token_balance, token_address)
-                
                 await update.message.reply_text(
-                    f"💰 **Balance Check Results:**\n\n"
-                    f"🟡 BNB Balance: {bnb_balance_ether:.6f} BNB\n"
-                    f"🪙 Token Balance ({token_address[:10]}...): {token_balance_formatted}\n"
+                    f"💰 **Balance:**\n"
+                    f"🟡 BNB: {bnb_balance_ether:.6f}\n"
+                    f"🪙 Token: {token_balance_formatted}\n"
                 )
             else:
-                # For buy/sell, send actual transaction
-                tx_hash = send_transaction(session["tokenId"], data["action"], payload)
-
-                await update.message.reply_text(
-                    f"🎉 **Transaction Successful!**\n"
-                    f"🔗 [View on BscScan](https://bscscan.com/tx/{tx_hash})"
+                amount_wei = w3.to_wei(float(data_amount), "ether")
+                slippage_bps = 0
+                payload = abi_encode(
+                    ["address", "uint256", "uint256"],
+                    [token_address, amount_wei, slippage_bps],
                 )
-
-            # 4. Reset session data for the next action
-            session["data"] = {"action": None, "token": None, "amount": None}
-
+                tx_hash = send_transaction(session["tokenId"], action, payload, session["type"])
+                await update.message.reply_text(
+                    f"🎉 **Done!**\n🔗 [View on BscScan](https://bscscan.com/tx/{tx_hash})"
+                )
         except Exception as e:
-            logger.error(f"Transaction failed: {e}")
+            logger.exception(f"Transaction failed: {e}")
             await update.message.reply_text(f"❌ Transaction failed: {str(e)}")
 
 
-def call_check_balance(token_id: int, payload_bytes: bytes) -> tuple:
+def call_check_balance(token_id: int, payload_bytes: bytes, agent_type: str) -> tuple:
     """
     Calls handleAction with check_balance action and decodes the result.
-    Returns (bnb_balance, token_balance) as integers (wei).
+    Returns (bnb_balance, token_balance) as integers (wei). Uses Trader contract (type B).
     """
-    func = contract.functions.handleAction(token_id, "check_balance", payload_bytes)
+    c = _contract(agent_type)
+    func = c.functions.handleAction(token_id, "check_balance", payload_bytes)
     
     # Use call() to simulate the transaction and get the result
     try:
@@ -333,12 +338,12 @@ def format_token_balance(balance_wei: int, token_address: str) -> str:
         return str(balance_wei)
 
 
-def send_transaction(token_id: int, action_str: str, payload_bytes: bytes) -> str:
+def send_transaction(token_id: int, action_str: str, payload_bytes: bytes, agent_type: str) -> str:
     """
-    Constructs and sends the transaction to the BSC blockchain.
+    Constructs and sends the transaction to the BSC blockchain (Echo or Trader contract depending on agent_type).
     """
-    # 1. Prepare transaction data
-    func = contract.functions.handleAction(token_id, action_str, payload_bytes)
+    c = _contract(agent_type)
+    func = c.functions.handleAction(token_id, action_str, payload_bytes)
     
     # 2. Estimate Gas & Build Transaction
     tx_params = {
