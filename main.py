@@ -65,6 +65,18 @@ if os.path.isfile(TOKENS_JSON_PATH):
     except Exception as e:
         logger.warning(f"Could not load tokens.json: {e}")
 
+# Chainlink Price Feed addresses on BSC (token symbol -> feed address)
+# These feeds return prices in USD with 8 decimals
+CHAINLINK_FEEDS: Dict[str, str] = {
+    "BNB": "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE",  # BNB/USD
+    "BTC": "0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf",  # BTC/USD
+    "BTCB": "0x264990fbd0A4796A3E3d8E37C4d5F87a3aCa5Ebf",  # BTCB/USD
+    "BUSD": "0xcBb98864Ef56E9042e7d2efEfE41dbEcFd1D86F1",  # BUSD/USD
+    "CAKE": "0xB6064eD41d4f67e353768aA239cA86f4F73665a1",  # CAKE/USD
+    "ETH": "0x9ef1B8c0E4F7dc8bF5719Ea496883DC6401d5b2e",  # ETH/USD
+    "USDT": "0xB97Ad0E74fa7d920791E90258A6E2085088b4320",  # USDT/USD
+}
+
 # --- SESSION STORAGE ---
 # Format: { user_id: { "type": "A"|"B"|"C", "tokenId": int, "data": { "action": str, "token": str, "amount": str } } }
 sessions: Dict[int, Any] = {}
@@ -72,6 +84,10 @@ sessions: Dict[int, Any] = {}
 # --- DCA STORAGE ---
 # Format: { user_id: [{"dca_id": str, "task": asyncio.Task, "token_id": int, "action": "buy_token"|"sell_token", "token_address": str, "token_symbol": str, "amount": str, "interval_seconds": int, "start_time": datetime}, ...] }
 active_dcas: Dict[int, list] = {}
+
+# --- LIMIT ORDER STORAGE ---
+# Format: { user_id: [{"order_id": str, "task": asyncio.Task, "token_id": int, "action": "buy_token"|"sell_token", "token_address": str, "token_symbol": str, "amount": str, "target_price": float, "created_time": datetime}, ...] }
+active_limit_orders: Dict[int, list] = {}
 
 # --- HELPER FUNCTIONS ---
 
@@ -99,33 +115,114 @@ def claude_get_intent(user_message: str, agent_type: str) -> Dict[str, Any]:
     if agent_type == "A":
         allowed = "Only allowed action: echo_message (write the user's message on-chain)."
     elif agent_type == "B":
-        allowed = "Allowed actions: buy_token, sell_token, check_balance. For buy_token/sell_token you need a token (BSC address 0x... or symbol like CAKE, BNB) and an amount in BNB. For check_balance only the token."
+        allowed = (
+            "Allowed actions: buy_token, sell_token, check_balance, get_price, buy_limit, sell_limit, cancel_limit, list_limits.\n"
+            "- buy_token/sell_token: instant buy/sell. Requires token (address 0x... or symbol) and amount in BNB.\n"
+            "- get_price: get the current price of a token in USDT. This is for INFORMATION ONLY, not for trading. Requires token (address 0x... or symbol like BTC, ETH, CAKE). Examples: 'what is the price of BTC?', 'what the price of BTC', 'price of ETH', 'how much is CAKE?', 'BTC price', 'show me ETH price', 'what's BTC worth?', 'tell me the price of BTC'\n"
+            "- buy_limit/sell_limit: place limit order. Requires: target_token (token to buy/sell like BTC, ETH), payment_amount (amount to spend in BNB or USDT), payment_currency ('BNB' or 'USDT'), and target_price in USDT per target_token. Examples: 'buy 0.0001 BNB of BTC when BTC price is 68260' → target_token=BTC, payment_amount=0.0001, payment_currency=BNB, target_price=68260. 'buy 10 USDT of ETH when ETH price is 2000' → target_token=ETH, payment_amount=10, payment_currency=USDT, target_price=2000.\n"
+            "- cancel_limit: cancel a limit order. Examples: 'cancel limit', 'cancel my order limit', 'cancel order', 'cancel limit BTC', 'cancel all limits', 'cancel my limit order'. If user says 'cancel limit' or 'cancel order' without specifying token, cancel all orders.\n"
+            "- list_limits: list all active limit orders. Examples: 'list limits', 'list limit', 'show limits', 'show my orders', 'my orders'.\n"
+            "- check_balance: check token and BNB balance. Requires token."
+        )
     else:  # agent_type == "C"
         allowed = (
-            "Allowed actions: start_dca_buy, start_dca_sell, stop_dca, list_dcas, check_balance.\n"
+            "Allowed actions: start_dca_buy, start_dca_sell, stop_dca, list_dcas, check_balance, get_price.\n"
             "- start_dca_buy/start_dca_sell: requires token (address 0x... or symbol), amount (BNB), and interval (e.g. '5 minutes', '1 hour', '30 seconds'). Multiple DCAs can run simultaneously.\n"
+            "- get_price: get the current price of a token in USDT. This is for INFORMATION ONLY, not for trading. Requires token (address 0x... or symbol like BTC, ETH, CAKE). Examples: 'what is the price of BTC?', 'what the price of BTC', 'price of ETH', 'how much is CAKE?', 'BTC price', 'what price is BTC?', 'tell me BTC price'\n"
             "- stop_dca: stops DCA(s). If user says 'stop DCA', 'stop my DCA', 'stop active DCA', 'stop all DCA' without specifying token or action, set both stop_action and stop_token to null (will stop all DCAs). If user specifies a token (e.g. 'stop DCA BTC'), set stop_token. If user specifies an action (e.g. 'stop buy DCA'), set stop_action. If both are specified, stop matching ones.\n"
             "- list_dcas: lists all active DCAs with details (token, action, amount, interval).\n"
             "- check_balance: check token and BNB balance. Requires token address (0x...) or symbol."
         )
     
     system = (
-        f"You are a blockchain bot. Agent type is {agent_type}. {allowed}\n"
-        "CRITICAL: Understand the USER'S INTENTION, not just exact wording. Be flexible and intelligent.\n"
-        "Understand the user in ANY language (English, French, Spanish, slang, etc.). Focus on INTENT, not exact phrases.\n"
-        "Examples of intent understanding:\n"
-        "- 'stop my active dca', 'stop dca', 'stop all dca', 'cancel dca' → stop_dca with stop_action=null, stop_token=null (stop all)\n"
-        "- 'stop btc dca', 'stop dca btc', 'cancel btc' → stop_dca with stop_token='BTC'\n"
-        "- 'stop buy dca', 'cancel buy orders' → stop_dca with stop_action='buy_token'\n"
-        "- 'buy cake', 'purchase cake', 'get cake' → buy_token with token='CAKE'\n"
-        "- 'check btc balance', 'show btc balance', 'what's my btc' → check_balance with token='BTC'\n"
-        "Token: accept symbol (CAKE, cake, BTC, btc, BNB...) or full address 0x.... If the user only gives a name/symbol you don't recognize as a standard token, set understood: false and ask for the token address (0x...).\n"
-        "Interval parsing: Convert time expressions to seconds. Examples: '5 minutes' = 300, '1 hour' = 3600, '30 seconds' = 30.\n"
-        "For stop_dca: If the user wants to stop DCA(s) but doesn't specify which one clearly, assume they want to stop ALL active DCAs (set stop_action=null, stop_token=null). Only ask for clarification if the request is truly ambiguous AND you cannot infer intent.\n"
-        "NEVER mention other agents or tools. Only mention what THIS agent can do.\n"
-        "Reply ONLY with a single JSON object, no markdown or extra text.\n"
-        f"If you understand the INTENTION: {{\"understood\": true, \"action\": \"...\", \"token\": \"...\" (for start/stop/check_balance), \"amount\": \"...\" (only for start), \"interval_seconds\": ... (only for start), \"stop_action\": \"buy_token\"|\"sell_token\"|null (only for stop_dca), \"stop_token\": \"...\"|null (only for stop_dca)}}\n"
-        "If the intent is truly unclear: {\"understood\": false, \"message\": \"Short reply explaining what you need.\"}"
+        f"You are an intelligent COORDINATOR AGENT for a blockchain trading system.\n"
+        f"Your role: Understand the user's INTENTION and route them to the correct action.\n\n"
+        f"Agent Type: {agent_type}. Available actions: {allowed}\n\n"
+        "CRITICAL: You are NOT a keyword matcher. You are an INTENTION UNDERSTANDER.\n"
+        "Your job is to ANALYZE what the user REALLY wants to accomplish, regardless of how they phrase it.\n\n"
+        "THINK LIKE A COORDINATOR:\n"
+        "1. Read the user's message\n"
+        "2. Ask yourself: 'What is the user trying to accomplish?'\n"
+        "3. Map that intention to the correct action\n"
+        "4. Extract the necessary parameters\n\n"
+        "INTENTION MAPPING (think about PURPOSE, not exact words):\n\n"
+        "INTENTION: User wants to KNOW THE PRICE of a token\n"
+        "→ Action: get_price\n"
+        "→ Examples (all mean the same thing): 'what is the price of BTC?', 'what the price of BTC', 'price of BTC', 'BTC price', 'how much is BTC?', 'tell me BTC price', 'show me BTC price', 'what's BTC worth?', 'BTC?', 'what price is BTC?'\n"
+        "→ Key insight: User is asking for INFORMATION, not trying to trade. No buying/selling mentioned.\n\n"
+        "INTENTION: User wants to TRADE RIGHT NOW (immediate execution)\n"
+        "→ Action: buy_token or sell_token\n"
+        "→ Examples: 'buy BTC', 'sell ETH', 'buy 0.001 BNB of CAKE', 'sell my BTC'\n"
+        "→ Key insight: User wants immediate action, no conditions or delays.\n\n"
+        "INTENTION: User wants to TRADE WHEN PRICE REACHES A TARGET (conditional execution)\n"
+        "→ Action: buy_limit or sell_limit\n"
+        "→ Examples: 'buy BTC when price is 68000', 'sell ETH at 2000', 'buy BTC when it reaches 68000', 'sell when BTC hits 70000'\n"
+        "→ Key insight: User mentions a PRICE CONDITION or TARGET. They want to wait for price.\n\n"
+        "INTENTION: User wants to TRADE REPEATEDLY AT INTERVALS (automated recurring trades)\n"
+        "→ Action: start_dca_buy or start_dca_sell\n"
+        "→ Examples: 'start DCA buy BTC every 5 minutes', 'DCA sell ETH every hour', 'buy BTC every 10 minutes'\n"
+        "→ Key insight: User mentions REPETITION or INTERVALS. They want automated recurring trades.\n\n"
+        "INTENTION: User wants to SEE WHAT'S CURRENTLY RUNNING (list active operations)\n"
+        "→ Action: list_limits or list_dcas\n"
+        "→ Examples: 'list limits', 'list limit', 'show my orders', 'my orders', 'what orders do I have?', 'show limits', 'list DCAs', 'my DCAs'\n"
+        "→ Key insight: User wants to VIEW/SEE/CHECK what's active. They're asking for STATUS.\n\n"
+        "INTENTION: User wants to STOP/CANCEL something that's running\n"
+        "→ Action: cancel_limit or stop_dca\n"
+        "→ Examples: 'cancel limit', 'cancel my order limit', 'cancel order', 'cancel my order', 'stop DCA', 'stop my DCA', 'cancel all limits', 'stop all DCAs'\n"
+        "→ Key insight: User wants to TERMINATE/STOP something. They mention cancel/stop/remove/delete.\n\n"
+        "INTENTION: User wants to CHECK THEIR BALANCE\n"
+        "→ Action: check_balance\n"
+        "→ Examples: 'check balance', 'my balance', 'balance of BTC', 'how much BTC do I have?', 'show balance'\n"
+        "→ Key insight: User wants to KNOW their holdings/balance.\n\n"
+        "UNDERSTANDING LIMIT ORDERS:\n"
+        "- User mentions a PRICE TARGET or CONDITION (e.g. 'when price is X', 'at price X', 'when BTC reaches X') → it's a limit order\n"
+        "- Identify: WHAT token they want to buy/sell (token field), HOW MUCH they want to spend (amount field), WHAT currency they're spending (payment_currency: BNB or USDT), and AT WHAT PRICE (target_price in USDT)\n"
+        "- The token to buy/sell is ALWAYS mentioned in the message - extract it! Examples:\n"
+        "  * 'buy BTC when it hits 68000' → token=BTC\n"
+        "  * 'Buy 0.0001 BNB of BTC when BTC reaches 68170' → token=BTC (BTC is mentioned twice - once as target, once in price condition)\n"
+        "  * 'spend 0.0001 BNB on BTC when BTC is 68210' → token=BTC\n"
+        "  * 'sell ETH when ETH reaches 2000' → token=ETH\n"
+        "- Examples of complete parsing:\n"
+        "  * 'buy BTC when it hits 68000' → action=buy_limit, token=BTC, amount=0.001 (default), payment_currency=BNB, target_price=68000\n"
+        "  * 'Buy 0.0001 BNB of BTC when BTC reaches 68170' → action=buy_limit, token=BTC, amount=0.0001, payment_currency=BNB, target_price=68170\n"
+        "  * 'sell 10 USDT worth of ETH when ETH reaches 2000' → action=sell_limit, token=ETH, amount=10, payment_currency=USDT, target_price=2000\n\n"
+        "UNDERSTANDING PAYMENT vs TARGET:\n"
+        "- Payment currency (BNB/USDT): What the user is SPENDING to buy, or RECEIVING when selling\n"
+        "- Target token: What the user wants to BUY or SELL (BTC, ETH, CAKE, etc.)\n"
+        "- If user says 'buy X BNB of Y' or 'spend X BNB on Y', X is payment_amount in BNB, Y is target_token\n"
+        "- If user says 'buy X USDT of Y', X is payment_amount in USDT, Y is target_token\n"
+        "- If user says 'sell Y when price is X', Y is target_token, X is target_price\n\n"
+        "UNDERSTANDING DCA:\n"
+        "- User wants REPEATED purchases/sales at INTERVALS → DCA\n"
+        "- Extract: token, amount (BNB), and interval (convert to seconds)\n\n"
+        "UNDERSTANDING STOP/CANCEL:\n"
+        "- User wants to STOP something → identify what (all, specific token, specific action)\n"
+        "- If unclear, default to stopping ALL\n\n"
+        "CRITICAL: PRICE QUERIES:\n"
+        "- If user asks about price WITHOUT buying/selling → action=get_price\n"
+        "- Examples of get_price: 'what is the price of BTC?', 'what the price of BTC', 'price of BTC', 'BTC price', 'how much is BTC?', 'what price is BTC?', 'tell me BTC price', 'show me BTC price'\n"
+        "- If user asks about price WITH buying/selling intention → buy_limit/sell_limit (NOT get_price)\n"
+        "- Examples of buy_limit (NOT get_price): 'buy BTC when price is 68000', 'buy BTC at 68000', 'buy BTC when it reaches 68000'\n\n"
+        "HOW TO WORK:\n"
+        "1. Read the user's message completely\n"
+        "2. Identify the CORE INTENTION (what they want to achieve)\n"
+        "3. Don't get stuck on exact wording - 'cancel my order limit' = 'cancel limit' = 'cancel order' = same intention\n"
+        "4. Don't require perfect grammar - 'list limit' (singular) = 'list limits' (plural) = same intention\n"
+        "5. Think about synonyms and variations - 'show' = 'list' = 'display' = same intention\n"
+        "6. Extract parameters from context, even if not explicitly stated\n\n"
+        "EXAMPLES OF INTENTION UNDERSTANDING:\n"
+        "- 'list limit' → User wants to SEE their orders → list_limits (don't require plural!)\n"
+        "- 'cancel my order limit' → User wants to STOP their order → cancel_limit (don't require exact phrase!)\n"
+        "- 'what the price of BTC' → User wants INFORMATION about price → get_price (don't require perfect grammar!)\n"
+        "- 'my orders' → User wants to VIEW what's active → list_limits (understand context!)\n"
+        "- 'cancel order' → User wants to TERMINATE something → cancel_limit (understand synonyms!)\n\n"
+        "LANGUAGE: Understand ANY language naturally. Don't look for specific phrases - understand the MEANING.\n"
+        "If the user's intention is CLEAR, extract it even if the wording is imperfect.\n"
+        "Only ask for clarification if the intention is truly ambiguous.\n"
+        "NEVER mention other agents or tools.\n\n"
+        "Reply ONLY with JSON, no markdown:\n"
+        f"If understood: {{\"understood\": true, \"action\": \"...\", \"token\": \"...\", \"amount\": \"...\", \"payment_currency\": \"BNB\"|\"USDT\"|null, \"interval_seconds\": ..., \"target_price\": ..., \"stop_action\": \"buy_token\"|\"sell_token\"|null, \"stop_token\": \"...\"|null}}\n"
+        "If not understood: {{\"understood\": false, \"message\": \"...\"}}"
     )
     try:
         client = __import__("anthropic").Anthropic(api_key=api_key)
@@ -143,19 +240,44 @@ def claude_get_intent(user_message: str, agent_type: str) -> Dict[str, Any]:
             text = re.sub(r"\s*```$", "", text)
         data = json.loads(text.strip())
         if data.get("understood"):
+            # Extract token - try different field names Claude might use
+            token_value = (
+                data.get("token") or 
+                data.get("target_token") or 
+                data.get("token_symbol") or 
+                ""
+            )
+            
+            # Extract amount - handle both string and numeric values
+            amount_value = data.get("amount") or data.get("payment_amount")
+            if amount_value is not None:
+                amount_str = str(amount_value).strip()
+            else:
+                amount_str = None
+            
+            # Extract payment_currency - handle string or null
+            payment_currency_value = data.get("payment_currency")
+            payment_currency_str = str(payment_currency_value).strip() if payment_currency_value else None
+            
             result = {
                 "understood": True,
-                "action": (data.get("action") or "").strip(),
-                "token": (data.get("token") or "").strip() or None,
-                "amount": (data.get("amount") or "").strip() or None,
-                "stop_action": (data.get("stop_action") or "").strip() or None,
-                "stop_token": (data.get("stop_token") or "").strip() or None,
+                "action": str(data.get("action") or "").strip(),
+                "token": str(token_value).strip() if token_value else None,
+                "amount": amount_str,
+                "payment_currency": payment_currency_str,
+                "stop_action": str(data.get("stop_action") or "").strip() if data.get("stop_action") else None,
+                "stop_token": str(data.get("stop_token") or "").strip() if data.get("stop_token") else None,
             }
             if "interval_seconds" in data:
                 try:
                     result["interval_seconds"] = int(data.get("interval_seconds", 0))
                 except (ValueError, TypeError):
                     result["interval_seconds"] = None
+            if "target_price" in data:
+                try:
+                    result["target_price"] = float(data.get("target_price", 0))
+                except (ValueError, TypeError):
+                    result["target_price"] = None
             return result
         return {"understood": False, "message": (data.get("message") or "I didn't understand. Please try again.")}
     except json.JSONDecodeError as e:
@@ -259,16 +381,242 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ---------------------------------------------------------
     elif session["type"] == "B":
         intent = claude_get_intent(text, "B")
+        
+        # Fallback: If Claude didn't understand but user seems to want to cancel limit order and there's only one active
         if not intent.get("understood"):
-            await update.message.reply_text(intent.get("message", "I didn't understand. Please try again."))
-            return
+            text_lower = text.lower()
+            # Check if user wants to cancel limit order (common phrases)
+            cancel_keywords = ["cancel", "delete", "remove", "stop"]
+            limit_keywords = ["limit", "order", "orders"]
+            
+            if any(kw in text_lower for kw in cancel_keywords) and any(kw in text_lower for kw in limit_keywords):
+                if user_id in active_limit_orders and len(active_limit_orders[user_id]) == 1:
+                    # Only one limit order active, cancel it automatically
+                    order = active_limit_orders[user_id][0]
+                    order_id = order.get("order_id")
+                    task = order.get("task")
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    del active_limit_orders[user_id]
+                    await update.message.reply_text("✅ Cancelled your limit order.")
+                    return
+                elif user_id in active_limit_orders and len(active_limit_orders[user_id]) > 1:
+                    # Multiple orders, ask which one
+                    await update.message.reply_text(
+                        f"You have {len(active_limit_orders[user_id])} active limit orders. Please specify which one to cancel: "
+                        "mention the token (e.g. 'cancel limit BTC') or action (e.g. 'cancel buy limit'), or say 'cancel all limits'."
+                    )
+                    return
+            
+            # Check if user wants to list limits (common variations)
+            list_keywords = ["list", "show", "display", "my"]
+            if any(kw in text_lower for kw in list_keywords) and any(kw in text_lower for kw in limit_keywords):
+                # User wants to list limits, set intent to understood
+                intent = {"understood": True, "action": "list_limits"}
+            
+            if not intent.get("understood"):
+                await update.message.reply_text(intent.get("message", "I didn't understand. Please try again."))
+                return
 
         action = (intent.get("action") or "").strip().lower()
         token_raw = intent.get("token")
         amount_raw = intent.get("amount")
 
-        if action not in ("buy_token", "sell_token", "check_balance"):
-            await update.message.reply_text("I can only help with: buy, sell, or check balance. Please rephrase.")
+        # --- LIMIT ORDERS ---
+        if action == "list_limits":
+            if user_id not in active_limit_orders or not active_limit_orders[user_id]:
+                await update.message.reply_text("❌ No active limit orders found.")
+                return
+            
+            messages = ["📊 **Active Limit Orders:**\n"]
+            for idx, order in enumerate(active_limit_orders[user_id], 1):
+                token_addr = order.get("token_address", "?")
+                token_symbol = order.get("token_symbol", token_addr[:10] + "...")
+                amount_bnb = order.get("amount", "?")
+                amount_original = order.get("amount_original", amount_bnb)
+                payment_currency = order.get("payment_currency", "BNB")
+                target_price = order.get("target_price", "?")
+                order_action = order.get("action", "?")
+                created_time = order.get("created_time", datetime.now())
+                
+                amount_display = f"{amount_original} {payment_currency}"
+                if payment_currency == "USDT" and amount_bnb != "?":
+                    try:
+                        amount_display += f" (~{float(amount_bnb):.6f} BNB)"
+                    except:
+                        pass
+                else:
+                    amount_display = f"{amount_bnb} BNB"
+                
+                messages.append(
+                    f"\n**Order #{idx}:**\n"
+                    f"🔄 Action: {order_action.replace('_', ' ').title()}\n"
+                    f"🪙 Token: {token_symbol} ({token_addr[:10]}...)\n"
+                    f"💰 Amount: {amount_display}\n"
+                    f"🎯 Target Price: {target_price} USDT per token\n"
+                    f"⏰ Created: {created_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            
+            await update.message.reply_text("".join(messages))
+            return
+
+        if action == "cancel_limit":
+            if user_id not in active_limit_orders or not active_limit_orders[user_id]:
+                await update.message.reply_text("❌ No active limit orders found to cancel.")
+                return
+
+            cancel_action = intent.get("stop_action")  # "buy_token" or "sell_token" or None
+            cancel_token_raw = intent.get("stop_token")  # Token symbol/address or None
+            
+            # Resolve cancel_token if provided
+            cancel_token_address = None
+            if cancel_token_raw:
+                cancel_token_address = resolve_token(cancel_token_raw)
+            
+            cancelled_count = 0
+            orders_list = active_limit_orders[user_id].copy()
+            
+            for order in orders_list:
+                should_cancel = False
+                order_id = order.get("order_id")
+                
+                # If no filters, cancel all
+                if not cancel_action and not cancel_token_address:
+                    should_cancel = True
+                else:
+                    # Check action filter
+                    if cancel_action and order.get("action") != cancel_action:
+                        continue
+                    # Check token filter
+                    if cancel_token_address and order.get("token_address") != cancel_token_address:
+                        continue
+                    should_cancel = True
+                
+                if should_cancel:
+                    task = order.get("task")
+                    if task and not task.done():
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    if user_id in active_limit_orders:
+                        active_limit_orders[user_id] = [o for o in active_limit_orders[user_id] if o.get("order_id") != order_id]
+                    cancelled_count += 1
+            
+            if user_id in active_limit_orders and not active_limit_orders[user_id]:
+                del active_limit_orders[user_id]
+            
+            if cancelled_count > 0:
+                await update.message.reply_text(f"✅ Cancelled {cancelled_count} limit order(s).")
+            else:
+                await update.message.reply_text("❌ No matching limit orders found to cancel.")
+            return
+
+        if action in ("buy_limit", "sell_limit"):
+            # Try to extract token from the original message if Claude didn't provide it
+            if not token_raw:
+                # Fallback: try to find token symbol in the original message
+                text_upper = text.upper()
+                for symbol in TOKEN_SYMBOLS.keys():
+                    if symbol in text_upper and symbol != "BNB":  # Don't use BNB as target token
+                        token_raw = symbol
+                        logger.info(f"Extracted token {symbol} from message as fallback")
+                        break
+            
+            token_address = resolve_token(token_raw) if token_raw else None
+            if not token_address:
+                await update.message.reply_text(
+                    f"I couldn't identify which token you want to trade. Please specify the token (e.g. BTC, ETH, CAKE) or its address (0x...)."
+                )
+                return
+
+            if not amount_raw:
+                await update.message.reply_text("Please specify an amount (e.g. '0.001 BNB' or '10 USDT').")
+                return
+
+            target_price = intent.get("target_price")
+            if not target_price:
+                await update.message.reply_text("Please specify a target price in USDT per token (e.g. 'sell BTC when price reaches 100000').")
+                return
+
+            payment_currency = intent.get("payment_currency", "BNB").upper()  # Default to BNB if not specified
+            
+            try:
+                amount_val = float(amount_raw.replace(",", "."))
+                target_price_val = float(str(target_price).replace(",", "."))
+            except (ValueError, TypeError):
+                await update.message.reply_text("Invalid amount or price. Use numbers (e.g. amount: 0.001, price: 10000).")
+                return
+
+            if amount_val <= 0 or target_price_val <= 0:
+                await update.message.reply_text("Amount and target price must be greater than 0.")
+                return
+
+            # Convert USDT to BNB if payment currency is USDT
+            amount_bnb = amount_val
+            if payment_currency == "USDT":
+                bnb_price = get_bnb_usdt_price()
+                if bnb_price is None or bnb_price <= 0:
+                    await update.message.reply_text("❌ Could not get BNB/USDT price. Please try again later.")
+                    return
+                amount_bnb = amount_val / bnb_price
+                logger.info(f"Converted {amount_val} USDT to {amount_bnb:.6f} BNB (BNB price: {bnb_price:.2f} USDT)")
+
+            # Get token symbol
+            token_symbol = token_raw.upper() if token_raw else token_address[:10] + "..."
+            for sym, addr in TOKEN_SYMBOLS.items():
+                if addr.lower() == token_address.lower():
+                    token_symbol = sym
+                    break
+
+            # Initialize list if needed
+            if user_id not in active_limit_orders:
+                active_limit_orders[user_id] = []
+
+            order_action = "buy_token" if action == "buy_limit" else "sell_token"
+            order_id = f"{order_action}_{token_address}_{datetime.now().timestamp()}"
+            chat_id = update.effective_chat.id
+            
+            task = asyncio.create_task(
+                limit_order_loop(user_id, order_id, session["tokenId"], order_action, token_address, str(amount_bnb), target_price_val, bot, chat_id, payment_currency, str(amount_val))
+            )
+            
+            order_info = {
+                "order_id": order_id,
+                "task": task,
+                "token_id": session["tokenId"],
+                "action": order_action,
+                "token_address": token_address,
+                "token_symbol": token_symbol,
+                "amount": str(amount_bnb),  # Store in BNB for execution
+                "amount_original": str(amount_val),  # Store original amount
+                "payment_currency": payment_currency,  # Store original currency
+                "target_price": target_price_val,
+                "created_time": datetime.now(),
+            }
+            active_limit_orders[user_id].append(order_info)
+
+            amount_display = f"{amount_val} {payment_currency}"
+            if payment_currency == "USDT":
+                amount_display += f" (~{amount_bnb:.6f} BNB)"
+            
+            await update.message.reply_text(
+                f"✅ **Limit Order Placed!**\n"
+                f"🔄 Action: {order_action.replace('_', ' ').title()}\n"
+                f"🪙 Token: {token_symbol} ({token_address[:10]}...)\n"
+                f"💰 Amount: {amount_display}\n"
+                f"🎯 Target Price: {target_price_val} USDT per token\n\n"
+                f"💡 Say 'cancel limit {token_symbol}' or 'list limits' to manage orders."
+            )
+            return
+
+        if action not in ("buy_token", "sell_token", "check_balance", "get_price"):
+            await update.message.reply_text("I can help with: buy, sell, check balance, get price, limit orders (buy_limit/sell_limit), cancel_limit, or list_limits. Please rephrase.")
             return
 
         token_address = resolve_token(token_raw) if token_raw else None
@@ -293,6 +641,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             data_amount = str(amount_val)
         else:
             data_amount = None
+
+        # --- GET PRICE ---
+        if action == "get_price":
+            token_symbol = token_raw.upper() if token_raw else None
+            if not token_symbol:
+                await update.message.reply_text("❌ Please specify a token (e.g., 'price of BTC', 'what is ETH price?').")
+                return
+            
+            await update.message.reply_text(f"⏳ Fetching price for {token_symbol}...")
+            try:
+                price = get_asset_price(token_symbol)
+                if price is not None:
+                    await update.message.reply_text(
+                        f"💰 **{token_symbol} Price:**\n"
+                        f"💵 {price:.2f} USDT per token"
+                    )
+                else:
+                    await update.message.reply_text(f"❌ Could not fetch price for {token_symbol}. Please try again later.")
+            except Exception as e:
+                logger.exception(f"Error getting price: {e}")
+                await update.message.reply_text(f"❌ Error fetching price: {str(e)}")
+            return
 
         # --- EXECUTE ---
         if action == "check_balance":
@@ -455,6 +825,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             
             await update.message.reply_text("".join(messages))
+            return
+
+        # --- GET PRICE ---
+        if action == "get_price":
+            token_raw = intent.get("token")
+            token_symbol = token_raw.upper() if token_raw else None
+            if not token_symbol:
+                await update.message.reply_text("❌ Please specify a token (e.g., 'price of BTC', 'what is ETH price?').")
+                return
+            
+            await update.message.reply_text(f"⏳ Fetching price for {token_symbol}...")
+            try:
+                price = get_asset_price(token_symbol)
+                if price is not None:
+                    await update.message.reply_text(
+                        f"💰 **{token_symbol} Price:**\n"
+                        f"💵 {price:.2f} USDT per token"
+                    )
+                else:
+                    await update.message.reply_text(f"❌ Could not fetch price for {token_symbol}. Please try again later.")
+            except Exception as e:
+                logger.exception(f"Error getting price: {e}")
+                await update.message.reply_text(f"❌ Error fetching price: {str(e)}")
             return
 
         # --- CHECK BALANCE ---
@@ -666,6 +1059,317 @@ def call_check_balance(token_id: int, payload_bytes: bytes, agent_type: str) -> 
     except Exception as e:
         logger.error(f"Check balance call failed: {e}")
         raise Exception(f"Failed to check balance: {str(e)}")
+
+
+def get_bnb_usdt_price() -> Optional[float]:
+    """
+    Gets the current BNB price in USDT using Chainlink BNB/USD feed.
+    Returns USDT per BNB, or None if error.
+    """
+    try:
+        bnb_feed_address = CHAINLINK_FEEDS.get("BNB")
+        if not bnb_feed_address:
+            logger.warning("BNB Chainlink feed not configured")
+            return None
+        
+        # Chainlink AggregatorV3Interface ABI (minimal for latestAnswer)
+        chainlink_abi = [
+            {
+                "inputs": [],
+                "name": "latestAnswer",
+                "outputs": [{"internalType": "int256", "name": "", "type": "int256"}],
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+        
+        feed = w3.eth.contract(address=Web3.to_checksum_address(bnb_feed_address), abi=chainlink_abi)
+        # latestAnswer returns price with 8 decimals
+        price_raw = feed.functions.latestAnswer().call()
+        price = float(price_raw) / (10 ** 8)  # Chainlink uses 8 decimals
+        return price
+    except Exception as e:
+        logger.warning(f"Failed to get BNB/USDT price from Chainlink: {e}")
+        return None
+
+
+def get_asset_price(token_symbol_or_address: str) -> Optional[float]:
+    """
+    Public function to get the current price of an asset.
+    Accepts either a token symbol (e.g., "BTC", "ETH", "CAKE") or a token address (0x...).
+    Returns price in USDT per token, or None if error.
+    
+    Args:
+        token_symbol_or_address: Token symbol (e.g., "BTC") or token address (0x...)
+    
+    Returns:
+        Price in USDT per token, or None if error
+    """
+    try:
+        # Check if it's an address or symbol
+        if token_symbol_or_address.startswith("0x") and len(token_symbol_or_address) == 42:
+            # It's an address
+            return get_token_price(token_symbol_or_address)
+        else:
+            # It's a symbol - resolve to address first
+            token_symbol = token_symbol_or_address.upper()
+            token_address = resolve_token(token_symbol)
+            
+            if not token_address:
+                logger.warning(f"Token address not found for symbol {token_symbol}")
+                return None
+            
+            return get_token_price(token_address)
+    except Exception as e:
+        logger.error(f"Error getting asset price for {token_symbol_or_address}: {e}")
+        return None
+
+
+def get_token_price(token_address: str) -> Optional[float]:
+    """
+    Gets the current price of a token in USDT using Chainlink Price Feeds.
+    Returns price in USDT per token, or None if error.
+    Uses Chainlink feeds which return prices with 8 decimals.
+    """
+    try:
+        # Find token symbol from address
+        token_symbol = None
+        for sym, addr in TOKEN_SYMBOLS.items():
+            if addr.lower() == token_address.lower():
+                token_symbol = sym
+                break
+        
+        if not token_symbol:
+            logger.warning(f"Token symbol not found for address {token_address}, cannot use Chainlink")
+            # Try PancakeSwap directly
+            return get_token_price_pancakeswap(token_address)
+        
+        # Get Chainlink feed address for this token
+        feed_address = CHAINLINK_FEEDS.get(token_symbol)
+        if not feed_address:
+            logger.warning(f"Chainlink feed not available for {token_symbol}, falling back to PancakeSwap")
+            # Fallback to PancakeSwap for tokens without Chainlink feed
+            return get_token_price_pancakeswap(token_address)
+        
+        # Chainlink AggregatorV3Interface ABI (minimal for latestAnswer)
+        chainlink_abi = [
+            {
+                "inputs": [],
+                "name": "latestAnswer",
+                "outputs": [{"internalType": "int256", "name": "", "type": "int256"}],
+                "stateMutability": "view",
+                "type": "function"
+            },
+            {
+                "inputs": [],
+                "name": "decimals",
+                "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+        
+        feed = w3.eth.contract(address=Web3.to_checksum_address(feed_address), abi=chainlink_abi)
+        # latestAnswer returns price with 8 decimals
+        price_raw = feed.functions.latestAnswer().call()
+        price = float(price_raw) / (10 ** 8)  # Chainlink uses 8 decimals
+        return price
+        
+    except Exception as e:
+        logger.warning(f"Failed to get price for {token_address} from Chainlink: {e}")
+        # Fallback to PancakeSwap
+        return get_token_price_pancakeswap(token_address)
+
+
+def get_token_price_pancakeswap(token_address: str) -> Optional[float]:
+    """
+    Fallback: Gets the current price of a token in USDT using PancakeSwap V2 router.
+    Returns price in USDT per token, or None if error.
+    """
+    try:
+        PANCAKESWAP_ROUTER = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
+        WBNB_ADDRESS = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+        USDT_ADDRESS = "0x55d398326f99059fF775485246999027B3197955"
+        
+        router_abi = [
+            {
+                "inputs": [
+                    {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
+                    {"internalType": "address[]", "name": "path", "type": "address[]"}
+                ],
+                "name": "getAmountsOut",
+                "outputs": [{"internalType": "uint256[]", "name": "amounts", "type": "uint256[]"}],
+                "stateMutability": "view",
+                "type": "function"
+            }
+        ]
+        
+        router = w3.eth.contract(address=Web3.to_checksum_address(PANCAKESWAP_ROUTER), abi=router_abi)
+        token_address = Web3.to_checksum_address(token_address)
+        
+        amount_in = w3.to_wei(1, "ether")
+        path = [
+            token_address,
+            Web3.to_checksum_address(WBNB_ADDRESS),
+            Web3.to_checksum_address(USDT_ADDRESS)
+        ]
+        
+        amounts = router.functions.getAmountsOut(amount_in, path).call()
+        if len(amounts) >= 3:
+            usdt_amount = amounts[2]
+            price = w3.from_wei(usdt_amount, "ether")
+            return float(price)
+        
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to get price for {token_address} from PancakeSwap: {e}")
+        return None
+
+
+async def limit_order_loop(user_id: int, order_id: str, token_id: int, action: str, token_address: str, amount: str, target_price: float, bot, chat_id: int, payment_currency: str = "BNB", amount_original: str = None):
+    """
+    Async loop that checks token price periodically and executes limit order when target price is reached.
+    For buy_limit: executes when current_price <= target_price (price drops to target)
+    For sell_limit: executes when current_price >= target_price (price rises to target)
+    """
+    logger.info(f"Limit order loop started for user {user_id} (Order {order_id}): {action} {amount} BNB at {target_price} USDT/token")
+    
+    try:
+        check_interval = 30  # Check price every 30 seconds
+        initial_price_checked = False
+        initial_price = None
+        
+        while user_id in active_limit_orders:
+            # Check if this order still exists
+            order_exists = False
+            for order in active_limit_orders.get(user_id, []):
+                if order.get("order_id") == order_id:
+                    order_exists = True
+                    break
+            if not order_exists:
+                logger.info(f"Limit order {order_id} removed from list, stopping loop")
+                break
+            
+            # Get current price
+            current_price = get_token_price(token_address)
+            
+            if current_price is None:
+                logger.warning(f"Could not get price for {token_address}, retrying in {check_interval}s")
+                await asyncio.sleep(check_interval)
+                continue
+            
+            # Store initial price on first check
+            if not initial_price_checked:
+                initial_price = current_price
+                initial_price_checked = True
+                logger.info(f"Initial price for {order_id}: {initial_price:.2f} USDT, target: {target_price:.2f} USDT")
+            
+            should_execute = False
+            if action == "buy_token":
+                # Buy_limit: execute when price DROPS to or below target
+                # Only execute if price was initially ABOVE target and now dropped to/below target
+                # OR if price is already below target and we're waiting for it to go back up (but that's not a buy_limit)
+                # Actually, for buy_limit: we want to buy when price drops TO the target from above
+                # If price is already below target, we should wait for it to go back up first, then drop again
+                # But simpler logic: buy when current_price <= target_price AND (initial_price was None or initial_price >= target_price)
+                if initial_price is not None:
+                    # Only execute if price was initially at or above target and now dropped to/below
+                    should_execute = (initial_price >= target_price) and (current_price <= target_price)
+                else:
+                    # Fallback: if we can't track initial price, use simple check
+                    should_execute = current_price <= target_price
+            else:  # sell_token
+                # Sell_limit: execute when price RISES to or above target
+                # Only execute if price was initially BELOW target and now rose to/above target
+                if initial_price is not None:
+                    should_execute = (initial_price <= target_price) and (current_price >= target_price)
+                else:
+                    should_execute = current_price >= target_price
+            
+            if should_execute:
+                logger.info(f"Limit order {order_id} triggered: current_price={current_price}, target_price={target_price}")
+                
+                # Execute transaction
+                try:
+                    amount_wei = w3.to_wei(float(amount), "ether")
+                    slippage_bps = 0
+                    payload = abi_encode(
+                        ["address", "uint256", "uint256"],
+                        [token_address, amount_wei, slippage_bps],
+                    )
+                    tx_hash = send_transaction(token_id, action, payload, "B")
+                    
+                    # Notify user
+                    amount_display = f"{amount} BNB"
+                    if payment_currency == "USDT" and amount_original:
+                        amount_display = f"{amount_original} {payment_currency} (~{amount} BNB)"
+                    
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🎯 **Limit Order Executed!**\n"
+                            f"🔄 Action: {action.replace('_', ' ').title()}\n"
+                            f"💰 Amount: {amount_display}\n"
+                            f"📊 Price: {current_price:.2f} USDT/token (target: {target_price:.2f} USDT)\n"
+                            f"🔗 [View on BscScan](https://bscscan.com/tx/{tx_hash})"
+                        ),
+                        parse_mode="Markdown"
+                    )
+                    
+                    # Remove order from list
+                    if user_id in active_limit_orders:
+                        active_limit_orders[user_id] = [o for o in active_limit_orders[user_id] if o.get("order_id") != order_id]
+                        if not active_limit_orders[user_id]:
+                            del active_limit_orders[user_id]
+                    
+                    logger.info(f"Limit order {order_id} executed and removed")
+                    break
+                    
+                except Exception as e:
+                    logger.error(f"Limit order execution failed for user {user_id} (Order {order_id}): {e}")
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=f"❌ Limit order execution failed: {str(e)}")
+                    except:
+                        pass
+                    # Continue checking in case it was a temporary error
+            
+            # Wait before next check
+            try:
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                logger.info(f"Limit order loop cancelled for user {user_id} (Order {order_id})")
+                raise
+    
+    except asyncio.CancelledError:
+        logger.info(f"Limit order loop stopped for user {user_id} (Order {order_id})")
+        try:
+            if user_id in active_limit_orders and active_limit_orders[user_id]:
+                active_limit_orders[user_id] = [o for o in active_limit_orders[user_id] if o.get("order_id") != order_id]
+                if not active_limit_orders[user_id]:
+                    del active_limit_orders[user_id]
+        except Exception as e:
+            logger.warning(f"Error cleaning up limit order {order_id}: {e}")
+        raise
+    except Exception as e:
+        logger.exception(f"Limit order loop error for user {user_id} (Order {order_id}): {e}")
+        try:
+            if user_id in active_limit_orders and active_limit_orders[user_id]:
+                active_limit_orders[user_id] = [o for o in active_limit_orders[user_id] if o.get("order_id") != order_id]
+                if not active_limit_orders[user_id]:
+                    del active_limit_orders[user_id]
+        except Exception as cleanup_error:
+            logger.warning(f"Error cleaning up limit order {order_id}: {cleanup_error}")
+        try:
+            await bot.send_message(chat_id=chat_id, text=f"❌ Limit order stopped due to error: {str(e)}")
+        except:
+            pass
 
 
 def format_token_balance(balance_wei: int, token_address: str) -> str:
